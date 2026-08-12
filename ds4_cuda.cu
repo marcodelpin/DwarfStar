@@ -102,6 +102,7 @@ static int g_model_cache_full;
 static cudaStream_t g_model_prefetch_stream;
 static cudaStream_t g_model_upload_stream;
 static int g_cublas_ready;
+static int g_cuda_sm_major;
 static int g_quality_mode;
 static int g_decode_fast_attention;
 static int g_decode_score_vec4;
@@ -1566,6 +1567,16 @@ static int cuda_q8_label_is_attention_output(const char *label) {
             strstr(label, "attention_output_b") != NULL);
 }
 
+static int cuda_skip_ordered_f16_matmul(void) {
+    if (getenv("DS4_CUDA_FORCE_ORDERED_F16_MATMUL") != NULL) return 0;
+    if (getenv("DS4_CUDA_NO_ORDERED_F16_MATMUL") != NULL) return 1;
+    /* Blackwell-class GPUs measured so far (Thor sm_110 and GB10 sm_121) run
+     * the regular 256-thread reduction faster than the ordered 32-thread decode
+     * path. Keep older architectures on the existing default unless explicitly
+     * overridden. */
+    return g_cuda_sm_major >= 11;
+}
+
 static int cuda_q8_use_dp4a(void) {
     return getenv("DS4_CUDA_NO_Q8_DP4A") == NULL;
 }
@@ -2599,6 +2610,12 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
         if (!cuda_ok(cudaSetDevice(c->device_id), "init set device")) return 0;
         cudaDeviceProp prop;
         if (cudaGetDeviceProperties(&prop, c->device_id) == cudaSuccess) {
+            /* minimal: device 0 decides the ordered-f16 dispatch for the whole
+             * process. Upstream PR #121 predates multi-GPU init, where this was
+             * unambiguous. On a HOMOGENEOUS rig (every real deployment so far)
+             * the two are identical; a MIXED-architecture rig would need the
+             * decision moved per-device into the matmul call sites. */
+            if (i == 0) g_cuda_sm_major = prop.major;
             fprintf(stderr, "ds4: CUDA backend initialized on %s (sm_%d%d) dev=%d\n",
                     prop.name, prop.major, prop.minor, c->device_id);
         }
@@ -15484,7 +15501,7 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         !serial_f16 &&
         !serial_router &&
         n_tok == 1u &&
-        getenv("DS4_CUDA_NO_ORDERED_F16_MATMUL") == NULL;
+        !cuda_skip_ordered_f16_matmul();
     const int small_out_one_token =
         !serial_f16 &&
         !serial_router &&
@@ -15734,7 +15751,7 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
     if (getenv("DS4_CUDA_NO_F16_PAIR_MATMUL") != NULL ||
         getenv("DS4_CUDA_SERIAL_F16_MATMUL") != NULL ||
         getenv("DS4_CUDA_SERIAL_ROUTER") != NULL ||
-        getenv("DS4_CUDA_NO_ORDERED_F16_MATMUL") != NULL) {
+        cuda_skip_ordered_f16_matmul()) {
         return ds4_gpu_matmul_f16_tensor(out0, model_map, model_size, weight0_offset,
                                            in_dim, out_dim, x, n_tok) &&
                ds4_gpu_matmul_f16_tensor(out1, model_map, model_size, weight1_offset,
