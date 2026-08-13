@@ -15748,10 +15748,15 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
     if (!out0 || !out1 || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0) {
         return 0;
     }
+    /* The explicit overrides keep their upstream meaning and still short-circuit the whole
+     * function for ANY n_tok. The AUTOMATIC architecture decision does NOT belong here: the
+     * ordered 32-thread kernel this PR is about is only reachable on the n_tok == 1 path
+     * below, so skipping from here would also bypass the n_tok > 1 cuBLAS batch branch --
+     * i.e. prefill -- which the change never intended to touch. */
     if (getenv("DS4_CUDA_NO_F16_PAIR_MATMUL") != NULL ||
         getenv("DS4_CUDA_SERIAL_F16_MATMUL") != NULL ||
         getenv("DS4_CUDA_SERIAL_ROUTER") != NULL ||
-        cuda_skip_ordered_f16_matmul()) {
+        getenv("DS4_CUDA_NO_ORDERED_F16_MATMUL") != NULL) {
         return ds4_gpu_matmul_f16_tensor(out0, model_map, model_size, weight0_offset,
                                            in_dim, out_dim, x, n_tok) &&
                ds4_gpu_matmul_f16_tensor(out1, model_map, model_size, weight1_offset,
@@ -15843,6 +15848,16 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
                               CUBLAS_GEMM_DEFAULT);
             return cublas_ok(st, "f16 pair matmul1");
         }
+        return ds4_gpu_matmul_f16_tensor(out0, model_map, model_size, weight0_offset,
+                                           in_dim, out_dim, x, n_tok) &&
+               ds4_gpu_matmul_f16_tensor(out1, model_map, model_size, weight1_offset,
+                                           in_dim, out_dim, x, n_tok);
+    }
+    /* One token: this is the ONLY site that reaches the ordered 32-thread pair kernel, so it
+     * is the only place the automatic Blackwell decision applies. DS4_CUDA_NO_ORDERED_F16_MATMUL
+     * has already returned above, so the helper here resolves to FORCE (re-enable) or to the
+     * sm_major test. */
+    if (cuda_skip_ordered_f16_matmul()) {
         return ds4_gpu_matmul_f16_tensor(out0, model_map, model_size, weight0_offset,
                                            in_dim, out_dim, x, n_tok) &&
                ds4_gpu_matmul_f16_tensor(out1, model_map, model_size, weight1_offset,
