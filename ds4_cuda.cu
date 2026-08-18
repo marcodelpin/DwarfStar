@@ -12576,6 +12576,113 @@ __device__ __forceinline__ static bool router_score_better(float av, uint32_t ai
     return av > bv || (av == bv && ai < bi);
 }
 
+/* General-shape router selection.
+ *
+ * router_select_kernel, router_select_parallel_kernel and
+ * router_select_warp_topk_kernel are all compiled for exactly 256 experts, 6
+ * used and a weight scale of 1.5 -- the warp kernel structurally so (8 experts
+ * per lane x 32 lanes, a 6-deep register top-k).  Anything else was refused by
+ * the entry points, which on CUDA is not a slow path but no path at all: the
+ * caller in ds4.c turns the 0 into ok=false for the whole graph.
+ *
+ * This kernel is the same algorithm as router_select_parallel_kernel with the
+ * three constants as parameters: the block computes sqrt(softplus(logit)) for
+ * every expert into dynamic shared memory, then thread 0 runs the same
+ * insertion top-k and the same weight normalisation.  Strictly additive -- the
+ * 256/6/1.5 shape still goes to the kernels it always went to, so nothing
+ * changes for the model we actually run.
+ *
+ * Dynamic shared memory is n_expert floats; the caller bounds n_expert by
+ * DS4_CUDA_ROUTER_MAX_EXPERTS so that allocation stays inside the per-block
+ * limit. */
+__global__ static void router_select_general_kernel(
+        int32_t *selected,
+        float *weights,
+        float *probs,
+        const float *bias,
+        const int32_t *hash,
+        const float *logits,
+        const int32_t *tokens,
+        int32_t token_scalar,
+        uint32_t hash_rows,
+        uint32_t n_tokens,
+        int has_bias,
+        int hash_mode,
+        uint32_t n_expert,
+        uint32_t n_expert_used,
+        float expert_weight_scale) {
+    extern __shared__ float router_sprob[];
+    const uint32_t t = blockIdx.x;
+    if (t >= n_tokens) return;
+    const float *log = logits + (uint64_t)t * n_expert;
+    float *prob = probs + (uint64_t)t * n_expert;
+    int32_t *sel = selected + (uint64_t)t * n_expert_used;
+    float *w = weights + (uint64_t)t * n_expert_used;
+
+    for (uint32_t i = threadIdx.x; i < n_expert; i += blockDim.x) {
+        const float p = sqrtf(softplus_dev(log[i]));
+        router_sprob[i] = p;
+        prob[i] = p;
+    }
+    __syncthreads();
+    if (threadIdx.x != 0) return;
+
+    if (hash_mode) {
+        int32_t tok = tokens ? tokens[t] : token_scalar;
+        if (tok < 0 || (uint32_t)tok >= hash_rows) tok = 0;
+        const int32_t *row = hash + (uint64_t)tok * n_expert_used;
+        for (uint32_t j = 0; j < n_expert_used; j++) sel[j] = row[j];
+    } else {
+        for (uint32_t j = 0; j < n_expert_used; j++) sel[j] = -1;
+        for (uint32_t e = 0; e < n_expert; e++) {
+            const float score = router_sprob[e] + (has_bias ? bias[e] : 0.0f);
+            for (uint32_t j = 0; j < n_expert_used; j++) {
+                if (sel[j] < 0 ||
+                    score > router_sprob[sel[j]] + (has_bias ? bias[sel[j]] : 0.0f)) {
+                    /* n_expert_used >= 1 is a caller precondition, so the
+                     * unsigned k never wraps: k starts at n_expert_used - 1
+                     * and the loop body is skipped when that equals j. */
+                    for (uint32_t k = n_expert_used - 1u; k > j; k--) sel[k] = sel[k - 1u];
+                    sel[j] = (int32_t)e;
+                    break;
+                }
+            }
+        }
+    }
+
+    float sum = 0.0f;
+    for (uint32_t j = 0; j < n_expert_used; j++) {
+        const int32_t e = sel[j];
+        const float v = (e >= 0 && (uint32_t)e < n_expert) ? router_sprob[e] : 0.0f;
+        w[j] = v;
+        sum += v;
+    }
+    sum = fmaxf(sum, 6.103515625e-5f);
+    for (uint32_t j = 0; j < n_expert_used; j++) w[j] = w[j] / sum * expert_weight_scale;
+}
+
+/* Upper bound on n_expert for router_select_general_kernel: the dynamic shared
+ * allocation is n_expert * sizeof(float), so 4096 experts is 16 KiB, well
+ * inside the 48 KiB every supported architecture gives a block by default.
+ * Larger shapes are declined rather than launched with a shared request the
+ * driver would reject at run time. */
+enum { DS4_CUDA_ROUTER_MAX_EXPERTS = 4096u };
+
+/* Shapes the router entry points can serve at all. */
+static int cuda_router_shape_supported(uint32_t n_expert, uint32_t n_expert_used) {
+    return n_expert != 0u && n_expert <= DS4_CUDA_ROUTER_MAX_EXPERTS &&
+           n_expert_used != 0u && n_expert_used <= n_expert;
+}
+
+/* The one shape the three fixed-size kernels are compiled for.  Everything the
+ * predicate above admits and this one rejects goes to
+ * router_select_general_kernel. */
+static int cuda_router_fast_shape(uint32_t n_expert, uint32_t n_expert_used,
+                                  float expert_weight_scale) {
+    return n_expert == 256u && n_expert_used == 6u &&
+           fabsf(expert_weight_scale - 1.5f) <= 1.0e-6f;
+}
+
 __global__ static void router_select_warp_topk_kernel(
         int32_t *selected,
         float *weights,
@@ -19360,25 +19467,42 @@ extern "C" int ds4_gpu_directional_steering_project_tensor(
 }
 extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t token, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits) {
     if (!selected || !weights || !probs || !logits || !model_map || n_expert_groups > 1u || n_group_used > 0u) return 0;
-    if (n_expert != 256u || n_expert_used != 6u || fabsf(expert_weight_scale - 1.5f) > 1.0e-6f) return 0;
+    if (!cuda_router_shape_supported(n_expert, n_expert_used)) return 0;
+    /* The 256/6 hardcode used to stand in for these bounds.  With the shape a
+     * parameter they have to be checked: the caller's buffers are sized from
+     * the model's own n_expert, and a mismatch is an out-of-bounds write. */
+    if (logits->bytes < (uint64_t)n_expert * sizeof(float) ||
+        probs->bytes < (uint64_t)n_expert * sizeof(float) ||
+        selected->bytes < (uint64_t)n_expert_used * sizeof(int32_t) ||
+        weights->bytes < (uint64_t)n_expert_used * sizeof(float)) {
+        return 0;
+    }
+    const int fast_shape = cuda_router_fast_shape(n_expert, n_expert_used, expert_weight_scale);
     int32_t tok = (int32_t)token;
     int ok = 1;
     const float *bias = NULL;
     const int32_t *hash = NULL;
     const int logical_tier = ds4_tensor_device_idx(selected);
     if (ok && has_bias && !hash_mode) {
-        if (bias_offset > model_size || model_size - bias_offset < 256u * sizeof(float)) ok = 0;
-        else bias = (const float *)cuda_resolve_weight_ptr(model_map, bias_offset, 256u * sizeof(float), logical_tier, "router_bias");
+        const uint64_t bias_bytes = (uint64_t)n_expert * sizeof(float);
+        if (bias_offset > model_size || model_size - bias_offset < bias_bytes) ok = 0;
+        else bias = (const float *)cuda_resolve_weight_ptr(model_map, bias_offset, bias_bytes, logical_tier, "router_bias");
         if (!bias) ok = 0;
     }
     if (ok && hash_mode) {
-        const uint64_t hash_bytes = (uint64_t)hash_rows * 6u * sizeof(int32_t);
+        const uint64_t hash_bytes = (uint64_t)hash_rows * n_expert_used * sizeof(int32_t);
         if (hash_offset > model_size || hash_bytes > model_size - hash_offset) ok = 0;
         else hash = (const int32_t *)cuda_resolve_weight_ptr(model_map, hash_offset, hash_bytes, logical_tier, "router_hash");
         if (!hash) ok = 0;
     }
     if (ok) {
-        if (getenv("DS4_CUDA_NO_WARP_ROUTER_SELECT") == NULL &&
+        if (!fast_shape) {
+            router_select_general_kernel<<<1, 256, (size_t)n_expert * sizeof(float), cuda_decode_stream()>>>(
+                                                         (int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
+                                                         bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
+                                                         has_bias && !hash_mode, hash_mode,
+                                                         n_expert, n_expert_used, expert_weight_scale);
+        } else if (getenv("DS4_CUDA_NO_WARP_ROUTER_SELECT") == NULL &&
             getenv("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT") == NULL) {
             dim3 block(32, 4, 1);
             router_select_warp_topk_kernel<<<1, block, 0, cuda_decode_stream()>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
@@ -19398,30 +19522,49 @@ extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_te
     return ok;
 }
 extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits, const ds4_gpu_tensor *tokens, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_tokens) {
-    if (n_expert != 256u || n_expert_used != 6u || fabsf(expert_weight_scale - 1.5f) > 1.0e-6f) return 0;
+    if (!cuda_router_shape_supported(n_expert, n_expert_used)) return 0;
     if (!selected || !weights || !probs || !logits || !tokens || !model_map || n_tokens == 0 ||
         n_expert_groups > 1u || n_group_used > 0u ||
-        logits->bytes < (uint64_t)n_tokens * 256u * sizeof(float) ||
-        probs->bytes < (uint64_t)n_tokens * 256u * sizeof(float) ||
-        selected->bytes < (uint64_t)n_tokens * 6u * sizeof(int32_t) ||
-        weights->bytes < (uint64_t)n_tokens * 6u * sizeof(float)) {
+        logits->bytes < (uint64_t)n_tokens * n_expert * sizeof(float) ||
+        probs->bytes < (uint64_t)n_tokens * n_expert * sizeof(float) ||
+        selected->bytes < (uint64_t)n_tokens * n_expert_used * sizeof(int32_t) ||
+        weights->bytes < (uint64_t)n_tokens * n_expert_used * sizeof(float)) {
         return 0;
     }
+    const int fast_shape = cuda_router_fast_shape(n_expert, n_expert_used, expert_weight_scale);
     const float *bias = NULL;
     const int32_t *hash = NULL;
     const int logical_tier = ds4_tensor_device_idx(selected);
     if (has_bias && !hash_mode) {
-        if (bias_offset > model_size || model_size - bias_offset < 256u * sizeof(float)) return 0;
-        bias = (const float *)cuda_resolve_weight_ptr(model_map, bias_offset, 256u * sizeof(float), logical_tier, "router_bias");
+        const uint64_t bias_bytes = (uint64_t)n_expert * sizeof(float);
+        if (bias_offset > model_size || model_size - bias_offset < bias_bytes) return 0;
+        bias = (const float *)cuda_resolve_weight_ptr(model_map, bias_offset, bias_bytes, logical_tier, "router_bias");
         if (!bias) return 0;
     }
     if (hash_mode) {
-        const uint64_t hash_bytes = (uint64_t)hash_rows * 6u * sizeof(int32_t);
+        const uint64_t hash_bytes = (uint64_t)hash_rows * n_expert_used * sizeof(int32_t);
         if (hash_offset > model_size || hash_bytes > model_size - hash_offset) return 0;
         hash = (const int32_t *)cuda_resolve_weight_ptr(model_map, hash_offset, hash_bytes, logical_tier, "router_hash");
         if (!hash) return 0;
     }
-    if (getenv("DS4_CUDA_NO_WARP_ROUTER_SELECT") == NULL &&
+    if (!fast_shape) {
+        router_select_general_kernel<<<n_tokens, 256, (size_t)n_expert * sizeof(float)>>>(
+                                                         (int32_t *)selected->ptr,
+                                                         (float *)weights->ptr,
+                                                         (float *)probs->ptr,
+                                                         bias,
+                                                         hash,
+                                                         (const float *)logits->ptr,
+                                                         (const int32_t *)tokens->ptr,
+                                                         0,
+                                                         hash_rows,
+                                                         n_tokens,
+                                                         has_bias && !hash_mode,
+                                                         hash_mode,
+                                                         n_expert,
+                                                         n_expert_used,
+                                                         expert_weight_scale);
+    } else if (getenv("DS4_CUDA_NO_WARP_ROUTER_SELECT") == NULL &&
         getenv("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT") == NULL) {
         dim3 block(32, 4, 1);
         router_select_warp_topk_kernel<<<(n_tokens + 3u) / 4u, block>>>((int32_t *)selected->ptr,
