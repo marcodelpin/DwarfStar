@@ -62,7 +62,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-metal-session-batch test-mxfp4-cuda test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test test-metal-session-batch test-mxfp4-cuda test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression test-cuda-prefill-mixed-score-bound strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut
@@ -213,9 +213,22 @@ cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu
 	$(CC) $(CFLAGS) -o ds4-eval ds4_eval_cpu.o ds4_help.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-agent ds4_agent_cpu.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
 
-cuda-regression: tests/cuda_long_context_smoke tests/test_cuda_ordered_f16_dispatch
+cuda-regression: tests/cuda_long_context_smoke tests/test_cuda_ordered_f16_dispatch tests/test_cuda_prefill_mixed_score_bound
 	./tests/cuda_long_context_smoke
 	./tests/test_cuda_ordered_f16_dispatch
+	./tests/test_cuda_prefill_mixed_score_bound
+
+# Bound of the mixed-prefill scalar fallback's shared score buffer (issue #803).
+# Drives the public entry point so it tests the launcher's decision, not a
+# restatement of the bound; every shape is a pair either side of the boundary.
+tests/test_cuda_prefill_mixed_score_bound.o: tests/test_cuda_prefill_mixed_score_bound.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_cuda_prefill_mixed_score_bound.c
+
+tests/test_cuda_prefill_mixed_score_bound: tests/test_cuda_prefill_mixed_score_bound.o ds4_cuda.o $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-cuda-prefill-mixed-score-bound: tests/test_cuda_prefill_mixed_score_bound
+	./tests/test_cuda_prefill_mixed_score_bound
 
 # Host-side check of the ordered-F16 dispatch decision. It #includes ds4_cuda.cu so
 # it exercises the real predicates instead of a restatement of them, which is also

@@ -43,7 +43,15 @@ enum {
     DS4_CUDA_SPLITKV_CHUNK = 512u,
     DS4_CUDA_SPLITKV_SCORE_CAP = 512u,
     DS4_CUDA_SPLITKV_S_MAX = 16u,
-    DS4_CUDA_SPLITKV_S_FLOOR = 4u
+    DS4_CUDA_SPLITKV_S_FLOOR = 4u,
+    /* Shared score buffer of attention_prefill_mixed_kernel, the scalar
+     * fallback of attention_prefill_mixed_launch.  The launcher declines any
+     * shape whose worst-case raw+compressed score count exceeds this, the same
+     * way ds4_gpu_attention_prefill_raw_heads_tensor declines window > 256 for
+     * attention_prefill_raw_kernel.  The kernel and that check must read the
+     * same constant: two spellings of the buffer size is how it drifted into
+     * an unbounded write in the first place. */
+    DS4_CUDA_PREFILL_MIXED_SCORE_CAP = 512u
 };
 
 /* struct ds4_gpu_tensor is defined in ds4_gpu.h (no longer opaque as of
@@ -1280,6 +1288,29 @@ static void *cuda_tmp_alloc_on(int logical_tier, uint64_t bytes, const char *wha
 
 static int cuda_attention_score_buffer_fits(uint32_t n_comp) {
     return n_comp <= DS4_CUDA_ATTENTION_SCORE_CAP - DS4_CUDA_ATTENTION_RAW_SCORE_CAP;
+}
+
+/* Worst-case score count of attention_prefill_mixed_kernel over all tokens.
+ * Inside the kernel, for token t:
+ *     raw_count    = window ? min(t + 1, window) : t + 1
+ *     visible_comp = min((t + 1) / ratio, n_comp)
+ * Both are non-decreasing in t, so the maximum is reached at t = n_tokens - 1
+ * and this is an exact bound, not a conservative one.  Returns uint64 because
+ * the two terms are independent uint32 and their sum can wrap. */
+static uint64_t cuda_prefill_mixed_scalar_scores(uint32_t n_tokens, uint32_t n_comp,
+                                                 uint32_t window, uint32_t ratio) {
+    if (n_tokens == 0u || ratio == 0u) return 0u;
+    const uint64_t raw = (window != 0u && n_tokens > window) ? (uint64_t)window
+                                                             : (uint64_t)n_tokens;
+    uint64_t comp = (uint64_t)n_tokens / ratio;
+    if (comp > (uint64_t)n_comp) comp = (uint64_t)n_comp;
+    return raw + comp;
+}
+
+static int cuda_prefill_mixed_scalar_fits(uint32_t n_tokens, uint32_t n_comp,
+                                          uint32_t window, uint32_t ratio) {
+    return cuda_prefill_mixed_scalar_scores(n_tokens, n_comp, window, ratio) <=
+           (uint64_t)DS4_CUDA_PREFILL_MIXED_SCORE_CAP;
 }
 
 static const char *cuda_model_ptr(const void *model_map, uint64_t offset) {
@@ -7754,7 +7785,12 @@ __global__ static void attention_prefill_mixed_kernel(
     uint32_t raw_count = t + 1u - raw_start;
     uint32_t visible_comp = (t + 1u) / ratio;
     if (visible_comp > n_comp) visible_comp = n_comp;
-    __shared__ float scores[512];
+    /* raw_count + visible_comp is bounded by DS4_CUDA_PREFILL_MIXED_SCORE_CAP
+     * on the host, in attention_prefill_mixed_launch -- see
+     * cuda_prefill_mixed_scalar_fits().  There is no in-kernel clamp on
+     * purpose: a clamp here would turn an unlaunched shape into a silently
+     * wrong answer, and would be unreachable, hence untestable. */
+    __shared__ float scores[DS4_CUDA_PREFILL_MIXED_SCORE_CAP];
     __shared__ float partial[256];
     __shared__ float max_s;
     __shared__ float denom;
@@ -18743,6 +18779,11 @@ static int attention_prefill_mixed_launch(
                                                                         head_dim);
         return cuda_ok(cudaGetLastError(), "attention mixed unpack launch");
     }
+    /* Last resort: the scalar kernel, whose score buffer is fixed at
+     * DS4_CUDA_PREFILL_MIXED_SCORE_CAP.  Decline rather than overflow it --
+     * returning 0 hands the call back to the CPU path, which is what every
+     * other unsupported shape here already does. */
+    if (!cuda_prefill_mixed_scalar_fits(n_tokens, n_comp, window, ratio)) return 0;
     dim3 grid(n_tokens, n_head, 1);
     attention_prefill_mixed_kernel<<<grid, 256>>>((float *)heads->ptr,
                                                   sinks,
