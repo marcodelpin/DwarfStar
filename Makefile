@@ -213,8 +213,19 @@ cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu
 	$(CC) $(CFLAGS) -o ds4-eval ds4_eval_cpu.o ds4_help.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-agent ds4_agent_cpu.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
 
-cuda-regression: tests/cuda_long_context_smoke
+cuda-regression: tests/cuda_long_context_smoke tests/test_cuda_ordered_f16_dispatch
 	./tests/cuda_long_context_smoke
+	./tests/test_cuda_ordered_f16_dispatch
+
+# Host-side check of the ordered-F16 dispatch decision. It #includes ds4_cuda.cu so
+# it exercises the real predicates instead of a restatement of them, which is also
+# why it needs the MMQ objects at link time. No CUDA API is called on any path it
+# takes, so it runs on a machine with no GPU free.
+tests/test_cuda_ordered_f16_dispatch: tests/test_cuda_ordered_f16_dispatch.cu ds4_cuda.cu $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ tests/test_cuda_ordered_f16_dispatch.cu $(MMQ_OBJS) $(CUDA_LDLIBS)
+
+test-cuda-ordered-f16-dispatch: tests/test_cuda_ordered_f16_dispatch
+	./tests/test_cuda_ordered_f16_dispatch
 
 tests/test_mxfp4_cuda: tests/test_mxfp4_cuda.cu $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -std=c++17 $(MMQ_INCLUDES) -o $@ $^ $(CUDA_LDLIBS)

@@ -102,6 +102,10 @@ static int g_model_cache_full;
 static cudaStream_t g_model_prefetch_stream;
 static cudaStream_t g_model_upload_stream;
 static int g_cublas_ready;
+/* True only when EVERY device this process was initialised on is an architecture
+ * this dispatch choice has actually been measured on. See
+ * cuda_arch_ordered_f16_measured() and cuda_skip_ordered_f16_matmul(). */
+static int g_cuda_ordered_f16_skip;
 static int g_quality_mode;
 static int g_decode_fast_attention;
 static int g_decode_score_vec4;
@@ -1566,6 +1570,36 @@ static int cuda_q8_label_is_attention_output(const char *label) {
             strstr(label, "attention_output_b") != NULL);
 }
 
+/* Architectures this dispatch choice has been measured on: sm_110 (Jetson AGX
+ * Thor, major 11) and sm_121 (GB10, major 12). Deliberately an enumeration and
+ * not `major >= 11`: an open-ended test would hand every future major a default
+ * that nothing has measured on it. Widen it when the data exists. */
+static int cuda_arch_ordered_f16_measured(int sm_major) {
+    return sm_major == 11 || sm_major == 12;
+}
+
+/* Whether to skip the ordered F16 path at the one-token decode sites.
+ *
+ * What this actually selects, mechanically:
+ *   - ds4_gpu_matmul_f16_pair_tensor(), n_tok == 1: the fused 32-thread
+ *     matmul_f16_pair_ordered_chunks_kernel, versus two ds4_gpu_matmul_f16_tensor
+ *     calls which -- with cuBLAS ready and no override -- each take the
+ *     cublas_one_token branch and issue a cublasGemmEx. The trade is ONE fused
+ *     ordered kernel against TWO cuBLAS GEMMs; it is NOT "32-thread versus
+ *     256-thread reduction", and matmul_f16_kernel is not on either side of it.
+ *   - ds4_gpu_matmul_f16_tensor(): `ordered_router` is tested BELOW the
+ *     cublas_one_token branch, so with cuBLAS ready it is already unreachable at
+ *     n_tok == 1. Gating it here changes only the cuBLAS-less, quality-mode and
+ *     DS4_CUDA_NO_F16_CUBLAS_ONE configurations.
+ *
+ * antirez/ds4#121 reported the skip as a decode win on Thor sm_110 and GB10
+ * sm_121; older architectures keep the existing default unless overridden. */
+static int cuda_skip_ordered_f16_matmul(void) {
+    if (getenv("DS4_CUDA_FORCE_ORDERED_F16_MATMUL") != NULL) return 0;
+    if (getenv("DS4_CUDA_NO_ORDERED_F16_MATMUL") != NULL) return 1;
+    return g_cuda_ordered_f16_skip;
+}
+
 static int cuda_q8_use_dp4a(void) {
     return getenv("DS4_CUDA_NO_Q8_DP4A") == NULL;
 }
@@ -2581,6 +2615,15 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
     cuda_decode_dispatch_env_refresh();
     g_current_logical_tier = -1;
 
+    /* The automatic ordered-F16 decision is process-global while dispatch is
+     * per-device, so it has to hold for EVERY device this process will use --
+     * "device 0 decides" is wrong in both directions on a mixed rig. Start
+     * optimistic and let any device that is not a measured architecture, or
+     * whose properties cannot be read at all, veto it; an unrecognised rig then
+     * falls back to the upstream default instead of inheriting a decision
+     * measured on a different GPU. */
+    g_cuda_ordered_f16_skip = 1;
+
     /* g_n_gpus is published incrementally so ds4_gpu_cleanup() can unwind
      * partial state on failure. We publish `i + 1` BEFORE allocating any
      * resources for context `i`, so even if (e.g.) stream creation
@@ -2599,8 +2642,11 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
         if (!cuda_ok(cudaSetDevice(c->device_id), "init set device")) return 0;
         cudaDeviceProp prop;
         if (cudaGetDeviceProperties(&prop, c->device_id) == cudaSuccess) {
+            if (!cuda_arch_ordered_f16_measured(prop.major)) g_cuda_ordered_f16_skip = 0;
             fprintf(stderr, "ds4: CUDA backend initialized on %s (sm_%d%d) dev=%d\n",
                     prop.name, prop.major, prop.minor, c->device_id);
+        } else {
+            g_cuda_ordered_f16_skip = 0;
         }
         /* Per-device stream. */
         cudaStream_t s = NULL;
@@ -15484,7 +15530,7 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         !serial_f16 &&
         !serial_router &&
         n_tok == 1u &&
-        getenv("DS4_CUDA_NO_ORDERED_F16_MATMUL") == NULL;
+        !cuda_skip_ordered_f16_matmul();
     const int small_out_one_token =
         !serial_f16 &&
         !serial_router &&
@@ -15731,6 +15777,11 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
     if (!out0 || !out1 || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0) {
         return 0;
     }
+    /* The explicit overrides keep their upstream meaning and still short-circuit the whole
+     * function for ANY n_tok. The AUTOMATIC architecture decision does NOT belong here: the
+     * ordered 32-thread kernel this PR is about is only reachable on the n_tok == 1 path
+     * below, so skipping from here would also bypass the n_tok > 1 cuBLAS batch branch --
+     * i.e. prefill -- which the change never intended to touch. */
     if (getenv("DS4_CUDA_NO_F16_PAIR_MATMUL") != NULL ||
         getenv("DS4_CUDA_SERIAL_F16_MATMUL") != NULL ||
         getenv("DS4_CUDA_SERIAL_ROUTER") != NULL ||
@@ -15826,6 +15877,16 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
                               CUBLAS_GEMM_DEFAULT);
             return cublas_ok(st, "f16 pair matmul1");
         }
+        return ds4_gpu_matmul_f16_tensor(out0, model_map, model_size, weight0_offset,
+                                           in_dim, out_dim, x, n_tok) &&
+               ds4_gpu_matmul_f16_tensor(out1, model_map, model_size, weight1_offset,
+                                           in_dim, out_dim, x, n_tok);
+    }
+    /* One token: this is the ONLY site that reaches the ordered 32-thread pair kernel, so it
+     * is the only place the automatic Blackwell decision applies. DS4_CUDA_NO_ORDERED_F16_MATMUL
+     * has already returned above, so the helper here resolves to FORCE (re-enable) or to the
+     * all-devices architecture flag. */
+    if (cuda_skip_ordered_f16_matmul()) {
         return ds4_gpu_matmul_f16_tensor(out0, model_map, model_size, weight0_offset,
                                            in_dim, out_dim, x, n_tok) &&
                ds4_gpu_matmul_f16_tensor(out1, model_map, model_size, weight1_offset,
