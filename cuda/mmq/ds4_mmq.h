@@ -14,7 +14,11 @@
 
 #pragma once
 
+#if defined(GGML_USE_HIP)
+#include "vendors/hip.h"
+#else
 #include <cuda_runtime.h>
+#endif
 #include <stddef.h>
 #include <stdint.h>
 
@@ -376,6 +380,16 @@ int ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa(
     float           clamp,
     cudaStream_t    stream);
 
+int ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_scratch_sizes(
+    int     expert_mid_dim,
+    int     expert_in_dim,
+    int     n_tokens,
+    int     n_experts,
+    int     n_expert_used,
+    size_t *input_q8_bytes,
+    size_t *down_q8_bytes,
+    size_t *work_bytes);
+
 int ds4_mmq_q4_K_moe_pair(
     const void    * W_a,
     const void    * W_b,
@@ -570,6 +584,19 @@ int ds4_mmq_q8_0_aligned_dense_vec(
     float       * out_f32,
     int           M,
     int           N,
+    int           K,
+    cudaStream_t  stream);
+
+// Decode-only pair: quantize the shared activation once and compute both
+// aligned projections in one row-concatenated launch.
+int ds4_mmq_q8_0_aligned_dense_vec_pair(
+    const void  * W0_aligned,
+    const void  * W1_aligned,
+    const float * X_f32,
+    float       * out0_f32,
+    float       * out1_f32,
+    int           M0,
+    int           M1,
     int           K,
     cudaStream_t  stream);
 
@@ -842,6 +869,16 @@ int ds4_mmq_q8_0_dense_vec(
     float       * out_f32,
     int           M,
     int           N,
+    int           K,
+    cudaStream_t  stream);
+
+int ds4_mmq_q4_K_dense_pair_vec(
+    const void  * W0_q4_K,
+    const void  * W1_q4_K,
+    const float * X_f32,
+    float       * out0_f32,
+    float       * out1_f32,
+    int           M,
     int           K,
     cudaStream_t  stream);
 

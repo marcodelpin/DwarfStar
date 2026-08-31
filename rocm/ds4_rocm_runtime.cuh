@@ -18,6 +18,18 @@ static uint64_t g_selected_readback_event_value;
 static cublasHandle_t g_cublas;
 static int g_cublas_ready;
 #ifdef __HIP_PLATFORM_AMD__
+static rocblas_handle g_rocblas;
+static int g_rocblas_ready;
+/* rocBLAS solution indices are library-version specific. Unknown versions use
+ * the library default; a rejected known solution disables the tuned path. */
+enum {
+    DS4_ROCBLAS_F16_SOLUTIONS_NONE = 0,
+    DS4_ROCBLAS_F16_SOLUTIONS_5_5_CD957402,
+    DS4_ROCBLAS_F16_SOLUTIONS_5_6_8D1AE90E,
+};
+static int g_rocblas_f16_solution_set;
+static int g_rocblas_f16_solutions_disabled;
+static int g_rocblas_attention_b_solution_disabled;
 #include "ds4_rocm_hipblaslt.cuh"
 #endif
 static int g_quality_mode;
@@ -25,6 +37,7 @@ static int g_glm_model;
 
 enum {
     DS4_ROCM_N_EXPERT = 256u,
+    DS4_ROCM_GLM53_N_EXPERT = 288u,
     DS4_ROCM_MAX_N_EXPERT = 384u,
     DS4_ROCM_N_EXPERT_USED = 8u,
     DS4_ROCM_STREAM_READ_WORKERS = DS4_ROCM_N_EXPERT_USED * 3u,
@@ -4510,7 +4523,6 @@ static int cuda_stream_selected_apply(
         const char **down_w) {
     if (g_ssd_streaming_mode &&
         !g_stream_selected_cache.loaded &&
-        getenv("DS4_ROCM_DISABLE_STREAMING_SPLIT_SELECTED") != NULL &&
         cuda_stream_selected_pending_matches(model_map,
                                              layer,
                                              n_total_expert,
@@ -5840,6 +5852,25 @@ extern "C" int ds4_gpu_init(void) {
         g_cublas_ready = 1;
     }
 #ifdef __HIP_PLATFORM_AMD__
+    if (!g_rocblas_ready) {
+        const rocblas_status st = rocblas_create_handle(&g_rocblas);
+        if (st != rocblas_status_success) {
+            fprintf(stderr, "ds4: rocBLAS create handle failed: status %d\n", (int)st);
+            return 0;
+        }
+        char version[64] = {0};
+        g_rocblas_f16_solution_set = DS4_ROCBLAS_F16_SOLUTIONS_NONE;
+        if (rocblas_get_version_string(version, sizeof(version)) == rocblas_status_success) {
+            if (strcmp(version, "5.5.0.cd957402") == 0) {
+                g_rocblas_f16_solution_set = DS4_ROCBLAS_F16_SOLUTIONS_5_5_CD957402;
+            } else if (strcmp(version, "5.6.0.8d1ae90e") == 0) {
+                g_rocblas_f16_solution_set = DS4_ROCBLAS_F16_SOLUTIONS_5_6_8D1AE90E;
+            }
+        }
+        __atomic_store_n(&g_rocblas_f16_solutions_disabled, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_rocblas_attention_b_solution_disabled, 0, __ATOMIC_RELAXED);
+        g_rocblas_ready = 1;
+    }
     if (!g_hipblaslt_ready) {
         if (hipblaslt_ok(hipblasLtCreate(&g_hipblaslt), "create handle")) {
             g_hipblaslt_ready = 1;
@@ -5862,6 +5893,14 @@ extern "C" void ds4_gpu_cleanup(void) {
         g_cublas = NULL;
     }
 #ifdef __HIP_PLATFORM_AMD__
+    if (g_rocblas_ready) {
+        (void)rocblas_destroy_handle(g_rocblas);
+        g_rocblas_ready = 0;
+        g_rocblas = NULL;
+        g_rocblas_f16_solution_set = DS4_ROCBLAS_F16_SOLUTIONS_NONE;
+        __atomic_store_n(&g_rocblas_f16_solutions_disabled, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_rocblas_attention_b_solution_disabled, 0, __ATOMIC_RELAXED);
+    }
     if (g_hipblaslt_ready) {
         (void)hipblasLtDestroy(g_hipblaslt);
         g_hipblaslt_ready = 0;
@@ -6170,6 +6209,25 @@ extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model
      * either allocate the whole GGUF image or, for sparse span sets, an oversized
      * envelope before the precise tensor-span cache gets a chance to run.
      */
+    return 1;
+}
+
+extern "C" int ds4_gpu_set_aux_model_map_range(
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t map_offset,
+        uint64_t map_size) {
+    if (!model_map || model_size == 0 || map_size == 0 ||
+        map_offset > model_size || map_size > model_size - map_offset) {
+        return 0;
+    }
+    if (cuda_model_range_is_cached(model_map, map_offset, map_size)) return 1;
+    if (!cuda_model_range_copy_uncached(model_map, map_offset, map_size,
+                                        "GLM-5.3 vision encoder")) {
+        return 0;
+    }
+    fprintf(stderr, DS4_GPU_LOG_PREFIX "mapped %.2f GiB auxiliary model\n",
+            (double)map_size / 1073741824.0);
     return 1;
 }
 
