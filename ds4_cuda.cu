@@ -811,6 +811,11 @@ static_assert(DS4_MAX_GPUS == 16, "DS4_MAX_GPUS stack tables sized for 16");
 ds4_gpu_ctx g_gpu[DS4_MAX_GPUS];
 int         g_n_gpus = 0;
 int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
+static bool g_device_is_spark = false;
+
+extern "C" int ds4_gpu_device_is_spark(void) {
+    return g_n_gpus == 1 && g_device_is_spark;
+}
 
 /* Per-pair pinned-host bounce buffers, indexed [src][dst]. Lazily grown
  * to the largest copy seen for that pair. Each pair is its own allocation
@@ -3256,6 +3261,8 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
         cudaDeviceProp prop;
         if (cudaGetDeviceProperties(&prop, c->device_id) == cudaSuccess) {
             if (!cuda_arch_ordered_f16_measured(prop.major)) g_cuda_ordered_f16_skip = 0;
+            if (i == 0) g_device_is_spark =
+                prop.integrated && prop.major == 12 && prop.minor == 1;
             fprintf(stderr, "ds4: CUDA backend initialized on %s (sm_%d%d) dev=%d\n",
                     prop.name, prop.major, prop.minor, c->device_id);
         } else {
@@ -3491,6 +3498,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     cuda_stream_expert_cache_clear_all();
     cuda_stream_selected_stage_release();
     g_n_gpus = 0;
+    g_device_is_spark = false;
     g_cublas_ready = 0;
 
     /* Per-device selective cache teardown (selective model cache). */
@@ -15448,10 +15456,12 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
               CUDA_DERIVED_Q8_0_ALIGNED_DENSE,
               in_dim, out_dim, 1u, aligned_bytes)
         : NULL;
-    if (aligned && n_tok == 1u) {
+    if (aligned && (n_tok == 1u ||
+                    (n_tok <= 8u && ds4_gpu_device_is_spark() &&
+                     !g_q8_dequant_gemm_enabled))) {
         const int rc = ds4_mmq_q8_0_aligned_dense_vec(
             aligned, (const float *)x->ptr, (float *)out->ptr,
-            (int)out_dim, 1, (int)in_dim, cuda_decode_stream());
+            (int)out_dim, (int)n_tok, (int)in_dim, cuda_decode_stream());
         if (rc == 0) return 1;
     }
     if (aligned && n_tok >= 512u && out_dim >= 2048u &&
@@ -24979,7 +24989,9 @@ static int routed_moe_launch(
             const cudaStream_t aligned_stream =
                 n_tokens == 1u ? cuda_decode_stream() : (cudaStream_t)0;
             int rc;
-            if (n_tokens == 1u) {
+            if (n_tokens == 1u ||
+                (n_tokens <= 8u && ds4_gpu_device_is_spark() &&
+                 !g_q8_dequant_gemm_enabled && expert_in_dim % 1024u == 0)) {
                 rc = ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
                     gate_aligned, up_aligned,
                     (const float *)x->ptr,
