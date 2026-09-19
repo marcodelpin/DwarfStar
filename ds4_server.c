@@ -6352,6 +6352,14 @@ typedef struct {
     openai_tool_stream tool;
 } openai_stream;
 
+/* A tool-enabled thinking model may keep reasoning past its first </think>
+ * and close a second time.  We hold the tentative answer for at most this
+ * many bytes so a short stray draft (or a </think> split across generated
+ * tokens) can still be rerouted to reasoning_content.  Past this window the
+ * text is treated as the answer and streamed, so ordinary responses keep
+ * flushing content incrementally instead of stalling until generation ends. */
+#define SECOND_REASONING_GUARD_BYTES 32
+
 static void openai_stream_start(const request *r, openai_stream *st) {
     memset(st, 0, sizeof(*st));
     st->active = true;
@@ -7231,7 +7239,8 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
                 if (limit > st->emit_pos) st->sent_reasoning = true;
                 st->emit_pos = limit + strlen("</think>");
                 st->guard_second_reasoning = false;
-            } else if (!tool && !final) {
+            } else if (!tool && !final &&
+                       raw_len - st->emit_pos <= SECOND_REASONING_GUARD_BYTES) {
                 return true;
             } else {
                 st->guard_second_reasoning = false;
@@ -8867,7 +8876,8 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
                 if (!anthropic_sse_close_block_live(fd, id, st)) return false;
                 st->emit_pos = limit + strlen("</think>");
                 st->guard_second_reasoning = false;
-            } else if (!tool && !final) {
+            } else if (!tool && !final &&
+                       raw_len - st->emit_pos <= SECOND_REASONING_GUARD_BYTES) {
                 return true;
             } else {
                 st->guard_second_reasoning = false;
@@ -15416,6 +15426,57 @@ static void test_openai_stream_reroutes_second_reasoning_pass(void) {
     close(sv[1]);
 }
 
+static void test_openai_tools_stream_content_is_incremental(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_HIGH;
+    r.has_tools = true;
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+
+    /* With tools enabled the answer must keep flowing as its own content
+     * deltas.  A regression held every byte until the final flush, so the
+     * client saw the whole answer appear at once after reasoning ended. */
+    const char *raw1 = "<think>reasoning</think>First part of a long answer ";
+    const char *raw2 =
+        "<think>reasoning</think>First part of a long answer that keeps going ";
+    const char *raw3 =
+        "<think>reasoning</think>First part of a long answer that keeps going "
+        "and only ends here";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_incremental",
+                                         &st, raw1, strlen(raw1), false));
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_incremental",
+                                         &st, raw2, strlen(raw2), false));
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_incremental",
+                                         &st, raw3, strlen(raw3), false));
+    TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_incremental", &st,
+                                       raw3, strlen(raw3), NULL, "stop", 5, 20));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "\"reasoning_content\":\"reasoning\"") != NULL);
+    int content_deltas = 0;
+    for (const char *p = out; (p = strstr(p, "\"delta\":{\"content\":")) != NULL; p++) {
+        content_deltas++;
+    }
+    TEST_ASSERT(content_deltas >= 2);
+    TEST_ASSERT(strstr(out, "\"content\":\"First part of a long answer") != NULL);
+    TEST_ASSERT(strstr(out, "data: [DONE]") != NULL);
+
+    free(out);
+    openai_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
 static void test_openai_stream_usage_reports_cache_details(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -19782,6 +19843,7 @@ static void ds4_server_unit_tests_run(void) {
     test_anthropic_tool_stream_sends_live_tool_use();
     test_openai_tool_stream_sends_incremental_text();
     test_openai_stream_reroutes_second_reasoning_pass();
+    test_openai_tools_stream_content_is_incremental();
     test_openai_stream_usage_reports_cache_details();
     test_responses_usage_reports_cache_details();
     test_openai_chat_stream_splits_reasoning_without_tools();
