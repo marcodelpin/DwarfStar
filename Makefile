@@ -814,7 +814,7 @@ cuda-regression: tests/cuda_long_context_smoke tests/test_cuda_ordered_f16_dispa
 tests/test_cuda_prefill_mixed_score_bound.o: tests/test_cuda_prefill_mixed_score_bound.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_cuda_prefill_mixed_score_bound.c
 
-tests/test_cuda_prefill_mixed_score_bound: tests/test_cuda_prefill_mixed_score_bound.o ds4_cuda.o $(MMQ_OBJS)
+tests/test_cuda_prefill_mixed_score_bound: tests/test_cuda_prefill_mixed_score_bound.o ds4_cuda.o ds4_image.o $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 test-cuda-prefill-mixed-score-bound: tests/test_cuda_prefill_mixed_score_bound
@@ -826,7 +826,7 @@ test-cuda-prefill-mixed-score-bound: tests/test_cuda_prefill_mixed_score_bound
 tests/test_cuda_router_general.o: tests/test_cuda_router_general.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_cuda_router_general.c
 
-tests/test_cuda_router_general: tests/test_cuda_router_general.o ds4_cuda.o $(MMQ_OBJS)
+tests/test_cuda_router_general: tests/test_cuda_router_general.o ds4_cuda.o ds4_image.o $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 test-cuda-router-general: tests/test_cuda_router_general
@@ -836,8 +836,8 @@ test-cuda-router-general: tests/test_cuda_router_general
 # it exercises the real predicates instead of a restatement of them, which is also
 # why it needs the MMQ objects at link time. No CUDA API is called on any path it
 # takes, so it runs on a machine with no GPU free.
-tests/test_cuda_ordered_f16_dispatch: tests/test_cuda_ordered_f16_dispatch.cu ds4_cuda.cu $(MMQ_OBJS)
-	$(NVCC) $(NVCCFLAGS) -o $@ tests/test_cuda_ordered_f16_dispatch.cu $(MMQ_OBJS) $(CUDA_LDLIBS)
+tests/test_cuda_ordered_f16_dispatch: tests/test_cuda_ordered_f16_dispatch.cu ds4_cuda.cu ds4_image.o $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ tests/test_cuda_ordered_f16_dispatch.cu ds4_image.o $(MMQ_OBJS) $(CUDA_LDLIBS)
 
 test-cuda-ordered-f16-dispatch: tests/test_cuda_ordered_f16_dispatch
 	./tests/test_cuda_ordered_f16_dispatch

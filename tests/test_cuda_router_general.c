@@ -9,8 +9,11 @@
  * entry points with another shape, so the limit was invisible.
  *
  * WHAT IT COVERS: both entry points, through the public ABI, at the shape they
- * always served (256/6/1.5, still handled by the untouched fixed-size kernels)
- * AND at shapes that now reach router_select_general_kernel.
+ * always served (256/6/1.5, still handled by the untouched fixed-size kernels),
+ * at upstream's V4.1 DSpark draft shape (128/3/1.5, router_select_warp_topk_kernel
+ * <128, 3>), AND at shapes that now reach router_select_general_kernel --
+ * including 128/3 at another scale, which the draft kernel (scale 1.5
+ * hardcoded) must not serve.
  *
  * WHY THE 256 CASES ARE NOT DECORATION: they validate the host reference
  * against kernels that are known good and are not touched by this change.  A
@@ -294,6 +297,13 @@ int main(void) {
     run_case("256/6/1.5 batch x5, bias",       256, 6, 1.5f, 5, 1, 0, 0);
     run_case("256/6/1.5 batch x5, hash",       256, 6, 1.5f, 5, 0, 1, 0);
 
+    printf("\n== upstream draft shape: the 128/3 warp kernel (scale 1.5 only) ==\n");
+    run_case("128/3/1.5 single, no bias",      128, 3, 1.5f, 1, 0, 0, 0);
+    run_case("128/3/1.5 single, bias",         128, 3, 1.5f, 1, 1, 0, 0);
+    run_case("128/3/1.5 single, ties",         128, 3, 1.5f, 1, 0, 0, 1);
+    run_case("128/3/1.5 batch x5, bias",       128, 3, 1.5f, 5, 1, 0, 0);
+    run_case("128/3/1.5 batch x5, hash",       128, 3, 1.5f, 5, 0, 1, 0);
+
     printf("\n== general shapes: refused outright before this change ==\n");
     run_case("384/8/2.5 single, no bias",      384, 8, 2.5f, 1, 0, 0, 0);
     run_case("384/8/2.5 single, bias",         384, 8, 2.5f, 1, 1, 0, 0);
@@ -303,6 +313,8 @@ int main(void) {
     run_case("128/4/1.0 single, bias",         128, 4, 1.0f, 1, 1, 0, 0);
     run_case("512/1/1.5 single, no bias",      512, 1, 1.5f, 1, 0, 0, 0);
     run_case("256/6/2.0 single, bias (scale only)", 256, 6, 2.0f, 1, 1, 0, 0);
+    run_case("128/3/2.0 single, bias (draft shape, scale only)", 128, 3, 2.0f, 1, 1, 0, 0);
+    run_case("128/3/2.0 batch x5, hash (draft shape, scale only)", 128, 3, 2.0f, 5, 0, 1, 0);
 
     printf("\n== shapes that must still be refused ==\n");
     run_refusal("n_expert=0 refused",                  0, 6, 0);
