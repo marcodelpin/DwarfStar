@@ -224,7 +224,9 @@ python3 gguf-tools/deepseek41_quantize.py \
 
 Omit `--dry-run` to write the file. Add `--resume` after an interrupted conversion.
 Use `libds4quants.so` on Linux. Gate/up experts use IQ2_XXS and down experts use
-Q2_K; attention, shared experts and the output head use Q8_0. Engram rows retain
+Q2_K; attention, shared experts and the output head use Q8_0. `--quant q4` uses
+Q4_K experts instead and `--quant mxfp4` keeps the released MXFP4 experts
+unchanged, repacked into GGUF blocks without calibration. Engram rows retain
 their original FP8 values and scales, packed together at the end of the GGUF for
 disk lookups. Vision and DSpark weights are not included.
 
@@ -249,6 +251,24 @@ For a calibrated file, pass the same `--imatrix FILE` used during conversion.
 Pass `--quant q4` to the audit as well when checking a Q4 file.
 The audit checks the complete layout, all non-expert tensors, sampled experts
 and native Engram rows. It does not replace [inference quality tests](quality-testing/deepseek-v4.1-flash-20260910/README.md).
+
+### Convert V4.1 DSpark
+
+The V4.1 support converter needs NumPy, the official config and tensor index,
+and only the shards containing `mtp.*` tensors (44, 45 and 46 of the pinned
+checkpoint). No imatrix or main-model GGUF is needed:
+
+```sh
+python3 gguf-tools/deepseek41_dspark.py \
+  --hf models/DeepSeek-V4.1-Flash \
+  --source-revision df42c109f1defefcbfcedbe7d905718a12266e40 \
+  --out gguf/DeepSeek-V4.1-Flash-DSpark.gguf
+```
+
+The result is 8.04 GiB. Routed experts keep their native MXFP4 payloads;
+dense weights expand losslessly to F16 or F32. Add `--dry-run` to inspect the
+layout, or `--verify` to compare every tensor in an existing output against
+the source. This file works only with the V4.1 Flash target.
 
 ## Convert A DSpark Support Checkpoint
 
